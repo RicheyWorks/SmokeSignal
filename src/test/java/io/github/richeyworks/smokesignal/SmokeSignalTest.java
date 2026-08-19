@@ -132,6 +132,38 @@ class SmokeSignalTest {
                 assertEquals(1, s.rangeQueries(), "one range");
                 assertEquals(6, s.requestsServed(), "six requests total");
                 assertEquals(0, s.errors(), "no request was refused");
+                assertTrue(s.line().contains("reqs=6"), "the readout line renders");
+            }
+        }
+    }
+
+    @Test
+    void anUnknownOpIsRefusedCountedAndHarmless(@TempDir Path dir) throws IOException {
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts());
+             SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store,
+                     SpillSerializer.forLongs(), SpillSerializer.forStrings())) {
+            store.put(5L, "five");
+
+            // Speak garbage at the protocol directly: an op byte the server never defined.
+            try (java.net.Socket raw = new java.net.Socket(
+                    java.net.InetAddress.getLoopbackAddress(), server.port())) {
+                java.io.DataOutputStream out = new java.io.DataOutputStream(raw.getOutputStream());
+                java.io.DataInputStream in = new java.io.DataInputStream(raw.getInputStream());
+                out.writeByte(99);                             // not an op
+                out.flush();
+                assertEquals(2 /* REPLY_ERROR */, in.readByte(),
+                        "an unknown op earns an error reply, not a dropped session");
+                assertTrue(in.readUTF().contains("unknown op"), "and says why");
+            }
+
+            // The refusal was counted, and the store is untouched by a garbage wire.
+            assertEquals(1, server.stats().errors(), "the refusal is on the meter");
+            assertEquals(0, server.stats().requestsServed(), "a refused op is not a served request");
+            assertEquals("five", store.get(5L), "the store never felt it");
+
+            // And the session that spoke garbage still works for a well-formed client after.
+            try (SmokeSignalClient<Long, String> fresh = client(server.port())) {
+                assertEquals("five", fresh.get(5L), "the wire keeps serving after a refusal");
             }
         }
     }

@@ -70,9 +70,12 @@ public final class SmokeSignalServer<K, V> implements Closeable {
             return gets + puts + deletes + sizeQueries + rangeQueries;
         }
 
-        /** A one-line readout in the ecosystem's house shape. */
+        /**
+         * A one-line readout in the ecosystem's house shape ({@link java.util.Locale#ROOT},
+         * so the line never changes shape with the default locale).
+         */
         public String line() {
-            return String.format(
+            return String.format(java.util.Locale.ROOT,
                     "conns=%d reqs=%d (get=%d put=%d del=%d size=%d range=%d) errors=%d",
                     connectionsAccepted, requestsServed(), gets, puts, deletes,
                     sizeQueries, rangeQueries, errors);
