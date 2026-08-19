@@ -94,4 +94,45 @@ class SmokeSignalTest {
             }
         }
     }
+
+    @Test
+    void theWireCountsItsOwnTraffic(@TempDir Path dir) throws IOException {
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts());
+             SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store,
+                     SpillSerializer.forLongs(), SpillSerializer.forStrings())) {
+            assertEquals(0, server.stats().requestsServed(), "a fresh wire has served nothing");
+
+            try (SmokeSignalClient<Long, String> a = client(server.port());
+                 SmokeSignalClient<Long, String> b = client(server.port())) {
+                a.put(1L, "x");
+                a.put(2L, "y");
+                b.get(1L);
+                b.delete(2L);
+                a.size();
+                a.countRange(0L, 10L);
+
+                // Two clients connected; six well-formed requests answered, broken out by op.
+                // Await the acceptor thread's connection count (it lands off the accept loop).
+                long deadline = System.currentTimeMillis() + 5_000;
+                while (server.stats().connectionsAccepted() < 2
+                        && System.currentTimeMillis() < deadline) {
+                    try {
+                        Thread.sleep(2);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                SmokeSignalServer.WireStats s = server.stats();
+                assertEquals(2, s.connectionsAccepted(), "two clients connected");
+                assertEquals(2, s.puts(), "two puts");
+                assertEquals(1, s.gets(), "one get");
+                assertEquals(1, s.deletes(), "one delete");
+                assertEquals(1, s.sizeQueries(), "one size");
+                assertEquals(1, s.rangeQueries(), "one range");
+                assertEquals(6, s.requestsServed(), "six requests total");
+                assertEquals(0, s.errors(), "no request was refused");
+            }
+        }
+    }
 }

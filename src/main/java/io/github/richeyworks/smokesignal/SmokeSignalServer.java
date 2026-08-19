@@ -16,6 +16,7 @@ import java.net.Socket;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * SmokeSignal — engine ten of the ecosystem: the wire. A zero-dependency, loopback-only
@@ -48,6 +49,36 @@ public final class SmokeSignalServer<K, V> implements Closeable {
     private final List<Socket> clients = new ArrayList<>();
     private volatile boolean closed;
 
+    // Server-side observability (Rub reaches the wire through these). All monotonic, thread-safe.
+    private final AtomicLong connectionsAccepted = new AtomicLong();
+    private final AtomicLong gets = new AtomicLong();
+    private final AtomicLong puts = new AtomicLong();
+    private final AtomicLong deletes = new AtomicLong();
+    private final AtomicLong sizeQueries = new AtomicLong();
+    private final AtomicLong rangeQueries = new AtomicLong();
+    private final AtomicLong errors = new AtomicLong();
+
+    /**
+     * A point-in-time readout of the wire's own traffic: connections accepted and requests
+     * served, broken out by op, plus refused requests. {@link #requestsServed()} is the sum of
+     * the five op counters — the wire's contribution to the observability story.
+     */
+    public record WireStats(long connectionsAccepted, long gets, long puts, long deletes,
+                            long sizeQueries, long rangeQueries, long errors) {
+        /** Every well-formed request the wire answered — the five op counters summed. */
+        public long requestsServed() {
+            return gets + puts + deletes + sizeQueries + rangeQueries;
+        }
+
+        /** A one-line readout in the ecosystem's house shape. */
+        public String line() {
+            return String.format(
+                    "conns=%d reqs=%d (get=%d put=%d del=%d size=%d range=%d) errors=%d",
+                    connectionsAccepted, requestsServed(), gets, puts, deletes,
+                    sizeQueries, rangeQueries, errors);
+        }
+    }
+
     private SmokeSignalServer(SmokeHouse<K, V> store, SpillSerializer<K> keySerializer,
                               SpillSerializer<V> valueSerializer, ServerSocket server) {
         this.store = store;
@@ -77,10 +108,17 @@ public final class SmokeSignalServer<K, V> implements Closeable {
         return server.getLocalPort();
     }
 
+    /** A snapshot of the wire's own traffic counters — the server side of observability. */
+    public WireStats stats() {
+        return new WireStats(connectionsAccepted.get(), gets.get(), puts.get(), deletes.get(),
+                sizeQueries.get(), rangeQueries.get(), errors.get());
+    }
+
     private void acceptLoop() {
         while (!closed) {
             try {
                 Socket socket = server.accept();
+                connectionsAccepted.incrementAndGet();
                 synchronized (clients) {
                     clients.add(socket);
                 }
@@ -109,6 +147,7 @@ public final class SmokeSignalServer<K, V> implements Closeable {
                 try {
                     handle(op, in, out);
                 } catch (RuntimeException e) {                 // bad request, store refusal…
+                    errors.incrementAndGet();
                     out.writeByte(REPLY_ERROR);
                     out.writeUTF(String.valueOf(e.getMessage()));
                 }
@@ -122,6 +161,7 @@ public final class SmokeSignalServer<K, V> implements Closeable {
     private void handle(byte op, DataInputStream in, DataOutputStream out) throws IOException {
         switch (op) {
             case OP_GET -> {
+                gets.incrementAndGet();
                 V value = store.get(keySerializer.read(in));
                 if (value == null) {
                     out.writeByte(REPLY_NULL);
@@ -131,21 +171,25 @@ public final class SmokeSignalServer<K, V> implements Closeable {
                 }
             }
             case OP_PUT -> {
+                puts.incrementAndGet();
                 K key = keySerializer.read(in);
                 V value = valueSerializer.read(in);
                 store.put(key, value);
                 out.writeByte(REPLY_VALUE);
             }
             case OP_DELETE -> {
+                deletes.incrementAndGet();
                 boolean existed = store.delete(keySerializer.read(in));
                 out.writeByte(REPLY_VALUE);
                 out.writeBoolean(existed);
             }
             case OP_SIZE -> {
+                sizeQueries.incrementAndGet();
                 out.writeByte(REPLY_VALUE);
                 out.writeInt(store.size());
             }
             case OP_COUNT_RANGE -> {
+                rangeQueries.incrementAndGet();
                 K lo = keySerializer.read(in);
                 K hi = keySerializer.read(in);
                 out.writeByte(REPLY_VALUE);
