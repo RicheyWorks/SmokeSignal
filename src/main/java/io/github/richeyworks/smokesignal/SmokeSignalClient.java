@@ -85,6 +85,68 @@ public final class SmokeSignalClient<K, V> implements Closeable {
         return in.readInt();
     }
 
+    /**
+     * Stage a batch of puts and deletes to send as ONE wire request (2026-08-19). The server
+     * reads the whole batch before touching its route, and hands it to the route whole — so
+     * when the served store's owner routed batches to a real atomic batcher (Twine, in the
+     * ecosystem), a wire client gets crash-atomic multi-key batches with this call. Nothing
+     * is sent until {@link Batch#commit()}.
+     */
+    public Batch batch() {
+        return new Batch();
+    }
+
+    /** A staged wire batch. Ops keep their staged order on the server. */
+    public final class Batch {
+
+        private final java.util.List<java.util.Map.Entry<K, V>> ops = new java.util.ArrayList<>();
+        private boolean committed;
+
+        public Batch put(K key, V value) {
+            requireStaging();
+            Objects.requireNonNull(key, "key");
+            Objects.requireNonNull(value, "value");
+            ops.add(java.util.Map.entry(key, value));
+            return this;
+        }
+
+        public Batch delete(K key) {
+            requireStaging();
+            Objects.requireNonNull(key, "key");
+            ops.add(new java.util.AbstractMap.SimpleImmutableEntry<>(key, null));
+            return this;
+        }
+
+        /** Send the batch as one request; answers how many ops the server applied. */
+        public int commit() throws IOException {
+            requireStaging();
+            committed = true;
+            synchronized (SmokeSignalClient.this) {
+                out.writeByte(SmokeSignalServer.OP_BATCH);
+                out.writeInt(ops.size());
+                for (java.util.Map.Entry<K, V> op : ops) {
+                    if (op.getValue() != null) {
+                        out.writeByte(SmokeSignalServer.BATCH_OP_PUT);
+                        keySerializer.write(op.getKey(), out);
+                        valueSerializer.write(op.getValue(), out);
+                    } else {
+                        out.writeByte(SmokeSignalServer.BATCH_OP_DELETE);
+                        keySerializer.write(op.getKey(), out);
+                    }
+                }
+                out.flush();
+                readReply();
+                return in.readInt();
+            }
+        }
+
+        private void requireStaging() {
+            if (committed) {
+                throw new IllegalStateException("batch already committed");
+            }
+        }
+    }
+
     private byte readReply() throws IOException {
         byte reply = in.readByte();
         if (reply == SmokeSignalServer.REPLY_ERROR) {

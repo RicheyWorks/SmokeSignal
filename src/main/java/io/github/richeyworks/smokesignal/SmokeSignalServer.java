@@ -59,17 +59,43 @@ public final class SmokeSignalServer<K, V> implements Closeable {
         boolean delete(K key) throws IOException;
     }
 
+    /** One op inside a wire batch: a put ({@code value != null}) or a delete. */
+    public record BatchOp<K, V>(K key, V value) {
+        public boolean isPut() {
+            return value != null;
+        }
+    }
+
+    /**
+     * Where a wire BATCH lands, whole (2026-08-19): the server reads every op off the socket
+     * first, then hands the complete list here in one call — so the route decides the batch's
+     * atomicity, and the wire never applies half a request. The default route (see
+     * {@link #serve(SmokeHouse, WriteRoute, SpillSerializer, SpillSerializer)}) applies ops
+     * in order through the {@link WriteRoute}, which is sequential, not atomic; a caller with
+     * a real atomic batcher (Twine is the ecosystem's) supplies its own and gets crash-atomic
+     * batches from any wire client. Sessions run on their own threads — a route over a
+     * one-at-a-time batcher must synchronize.
+     */
+    @FunctionalInterface
+    public interface BatchRoute<K, V> {
+        void apply(List<BatchOp<K, V>> ops) throws IOException;
+    }
+
     static final byte OP_GET = 1;
     static final byte OP_PUT = 2;
     static final byte OP_DELETE = 3;
     static final byte OP_SIZE = 4;
     static final byte OP_COUNT_RANGE = 5;
+    static final byte OP_BATCH = 6;                            // 2026-08-19: batches over the wire
+    static final byte BATCH_OP_PUT = 1;
+    static final byte BATCH_OP_DELETE = 2;
     static final byte REPLY_NULL = 0;
     static final byte REPLY_VALUE = 1;
     static final byte REPLY_ERROR = 2;
 
     private final SmokeHouse<K, V> store;
     private final WriteRoute<K, V> writeRoute;
+    private final BatchRoute<K, V> batchRoute;
     private final SpillSerializer<K> keySerializer;
     private final SpillSerializer<V> valueSerializer;
     private final ServerSocket server;
@@ -84,18 +110,21 @@ public final class SmokeSignalServer<K, V> implements Closeable {
     private final AtomicLong deletes = new AtomicLong();
     private final AtomicLong sizeQueries = new AtomicLong();
     private final AtomicLong rangeQueries = new AtomicLong();
+    private final AtomicLong batchRequests = new AtomicLong();
     private final AtomicLong errors = new AtomicLong();
 
     /**
      * A point-in-time readout of the wire's own traffic: connections accepted and requests
      * served, broken out by op, plus refused requests. {@link #requestsServed()} is the sum of
-     * the five op counters — the wire's contribution to the observability story.
+     * the six op counters — the wire's contribution to the observability story. ({@code batches}
+     * counts BATCH requests, not the ops inside them — the ops land through the batch route,
+     * whose owner meters them however it meters anything else.)
      */
     public record WireStats(long connectionsAccepted, long gets, long puts, long deletes,
-                            long sizeQueries, long rangeQueries, long errors) {
-        /** Every well-formed request the wire answered — the five op counters summed. */
+                            long sizeQueries, long rangeQueries, long batches, long errors) {
+        /** Every well-formed request the wire answered — the six op counters summed. */
         public long requestsServed() {
-            return gets + puts + deletes + sizeQueries + rangeQueries;
+            return gets + puts + deletes + sizeQueries + rangeQueries + batches;
         }
 
         /**
@@ -104,17 +133,19 @@ public final class SmokeSignalServer<K, V> implements Closeable {
          */
         public String line() {
             return String.format(java.util.Locale.ROOT,
-                    "conns=%d reqs=%d (get=%d put=%d del=%d size=%d range=%d) errors=%d",
+                    "conns=%d reqs=%d (get=%d put=%d del=%d size=%d range=%d batch=%d) errors=%d",
                     connectionsAccepted, requestsServed(), gets, puts, deletes,
-                    sizeQueries, rangeQueries, errors);
+                    sizeQueries, rangeQueries, batches, errors);
         }
     }
 
     private SmokeSignalServer(SmokeHouse<K, V> store, WriteRoute<K, V> writeRoute,
+                              BatchRoute<K, V> batchRoute,
                               SpillSerializer<K> keySerializer,
                               SpillSerializer<V> valueSerializer, ServerSocket server) {
         this.store = store;
         this.writeRoute = writeRoute;
+        this.batchRoute = batchRoute;
         this.keySerializer = keySerializer;
         this.valueSerializer = valueSerializer;
         this.server = server;
@@ -149,10 +180,36 @@ public final class SmokeSignalServer<K, V> implements Closeable {
                                                        SpillSerializer<K> keySerializer,
                                                        SpillSerializer<V> valueSerializer)
             throws IOException {
+        Objects.requireNonNull(writeRoute, "writeRoute");
+        // Default batch route: in order, through the write route — sequential, NOT atomic.
+        return serve(store, writeRoute, ops -> {
+            for (BatchOp<K, V> op : ops) {
+                if (op.isPut()) {
+                    writeRoute.put(op.key(), op.value());
+                } else {
+                    writeRoute.delete(op.key());
+                }
+            }
+        }, keySerializer, valueSerializer);
+    }
+
+    /**
+     * Full routing control: reads answer from {@code store}, single writes land through
+     * {@code writeRoute}, and wire BATCHes land whole through {@code batchRoute} — the seam
+     * a composed caller ties to a real atomic batcher (Twine), making crash-atomic multi-key
+     * batches available to any wire client.
+     */
+    public static <K, V> SmokeSignalServer<K, V> serve(SmokeHouse<K, V> store,
+                                                       WriteRoute<K, V> writeRoute,
+                                                       BatchRoute<K, V> batchRoute,
+                                                       SpillSerializer<K> keySerializer,
+                                                       SpillSerializer<V> valueSerializer)
+            throws IOException {
         Objects.requireNonNull(store, "store");
         ServerSocket server = new ServerSocket(0, 16, InetAddress.getLoopbackAddress());
         SmokeSignalServer<K, V> s = new SmokeSignalServer<>(store,
                 Objects.requireNonNull(writeRoute, "writeRoute"),
+                Objects.requireNonNull(batchRoute, "batchRoute"),
                 Objects.requireNonNull(keySerializer, "keySerializer"),
                 Objects.requireNonNull(valueSerializer, "valueSerializer"), server);
         s.acceptor.start();
@@ -167,7 +224,7 @@ public final class SmokeSignalServer<K, V> implements Closeable {
     /** A snapshot of the wire's own traffic counters — the server side of observability. */
     public WireStats stats() {
         return new WireStats(connectionsAccepted.get(), gets.get(), puts.get(), deletes.get(),
-                sizeQueries.get(), rangeQueries.get(), errors.get());
+                sizeQueries.get(), rangeQueries.get(), batchRequests.get(), errors.get());
     }
 
     private void acceptLoop() {
@@ -250,6 +307,30 @@ public final class SmokeSignalServer<K, V> implements Closeable {
                 K hi = keySerializer.read(in);
                 out.writeByte(REPLY_VALUE);
                 out.writeInt(store.countRange(lo, hi));
+            }
+            case OP_BATCH -> {
+                batchRequests.incrementAndGet();
+                // Read the WHOLE batch off the socket before touching the route: the wire
+                // never applies half a request, whatever the route's atomicity.
+                int count = in.readInt();
+                if (count < 0) {
+                    throw new IllegalArgumentException("negative batch size " + count);
+                }
+                List<BatchOp<K, V>> ops = new ArrayList<>(count);
+                for (int i = 0; i < count; i++) {
+                    byte type = in.readByte();
+                    K key = keySerializer.read(in);
+                    if (type == BATCH_OP_PUT) {
+                        ops.add(new BatchOp<>(key, valueSerializer.read(in)));
+                    } else if (type == BATCH_OP_DELETE) {
+                        ops.add(new BatchOp<>(key, null));
+                    } else {
+                        throw new IllegalArgumentException("unknown batch op type " + type);
+                    }
+                }
+                batchRoute.apply(ops);
+                out.writeByte(REPLY_VALUE);
+                out.writeInt(ops.size());
             }
             default -> throw new IllegalArgumentException("unknown op " + op);
         }

@@ -39,6 +39,13 @@ op lands on the store's single writer lock). A dead wire never hurts the store.
   behavior: the route *is* the store. Same lesson Twine's sink seam taught, pointed at the
   wire; WholeHog's findings ledger carried it as "deliberately unsolved" until this consumer
   arrived.
+- **Batches cross whole (2026-08-19).** `OP_BATCH` carries a staged list of puts/deletes as
+  one request; the server reads the entire batch off the socket before touching its
+  `BatchRoute`, so the route decides atomicity and the wire never applies half a request.
+  The default route applies in order through the `WriteRoute` (sequential, honestly not
+  atomic); a caller with a real atomic batcher — Twine is the ecosystem's — supplies its own
+  and gives every wire client crash-atomic multi-key batches. Client side:
+  `wire.batch().put(k, v).delete(k2).commit()`.
 
 ## The ecosystem
 

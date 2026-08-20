@@ -15,6 +15,7 @@ import java.util.TreeMap;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -169,6 +170,66 @@ class SmokeSignalTest {
                 assertEquals(1, routedPuts.get(), "exactly one routed put");
                 assertEquals(2, routedDeletes.get(), "both deletes routed");
             }
+        }
+    }
+
+    @Test
+    void aBatchCrossesTheWireWholeAndLandsThroughTheBatchRoute(@TempDir Path dir)
+            throws IOException {
+        // The route receives the COMPLETE batch in one call, in staged order — the atomicity
+        // decision belongs to the route, and the wire never applies half a request.
+        java.util.List<Integer> batchSizes = java.util.Collections.synchronizedList(
+                new java.util.ArrayList<>());
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts())) {
+            SmokeSignalServer.BatchRoute<Long, String> route = ops -> {
+                batchSizes.add(ops.size());
+                for (SmokeSignalServer.BatchOp<Long, String> op : ops) {
+                    if (op.isPut()) {
+                        store.put(op.key(), op.value());
+                    } else {
+                        store.delete(op.key());
+                    }
+                }
+            };
+            SmokeSignalServer.WriteRoute<Long, String> writes =
+                    new SmokeSignalServer.WriteRoute<>() {
+                        @Override public void put(Long k, String v) throws IOException { store.put(k, v); }
+                        @Override public boolean delete(Long k) throws IOException { return store.delete(k); }
+                    };
+            try (SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store, writes,
+                         route, SpillSerializer.forLongs(), SpillSerializer.forStrings());
+                 SmokeSignalClient<Long, String> wire = client(server.port())) {
+                int applied = wire.batch()
+                        .put(1L, "a").put(2L, "b").put(3L, "c")
+                        .delete(2L)
+                        .commit();
+                assertEquals(4, applied, "the server reports the whole batch applied");
+                assertEquals(java.util.List.of(4), batchSizes,
+                        "the route saw ONE call with all four ops");
+                assertEquals("a", wire.get(1L));
+                assertNull(wire.get(2L), "the staged delete landed in order");
+                assertEquals("c", wire.get(3L));
+                assertEquals(1, server.stats().batches(), "the batch is on the meter, once");
+            }
+        }
+    }
+
+    @Test
+    void theDefaultBatchRouteAppliesInOrderThroughTheWriteRoute(@TempDir Path dir)
+            throws IOException {
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts());
+             SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store,
+                     SpillSerializer.forLongs(), SpillSerializer.forStrings());
+             SmokeSignalClient<Long, String> wire = client(server.port())) {
+            wire.batch().put(10L, "x").put(10L, "y").delete(99L).commit();
+            assertEquals("y", store.get(10L), "last writer wins inside the batch");
+            assertEquals(1, store.size());
+            // A committed batch cannot be reused.
+            SmokeSignalClient<Long, String>.Batch b = wire.batch();
+            b.put(1L, "once");
+            b.commit();
+            assertThrows(IllegalStateException.class, () -> b.put(2L, "again"),
+                    "a committed batch refuses more staging");
         }
     }
 
