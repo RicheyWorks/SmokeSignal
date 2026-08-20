@@ -86,6 +86,38 @@ public final class SmokeSignalClient<K, V> implements Closeable {
     }
 
     /**
+     * Fetch every record in {@code [lo, hi]} (both inclusive, by the store's comparator), in
+     * key order (2026-08-20) — {@link #countRange} could always count them; this delivers
+     * them. The reply is materialized, so the memory bound on both ends is the range's size:
+     * ask for sane ranges, the same honesty countRange always demanded.
+     */
+    public synchronized java.util.LinkedHashMap<K, V> rangeQuery(K lo, K hi) throws IOException {
+        out.writeByte(SmokeSignalServer.OP_RANGE);
+        keySerializer.write(lo, out);
+        keySerializer.write(hi, out);
+        out.flush();
+        readReply();
+        int count = in.readInt();
+        java.util.LinkedHashMap<K, V> records = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < count; i++) {
+            records.put(keySerializer.read(in), valueSerializer.read(in));
+        }
+        return records;
+    }
+
+    /**
+     * The server's own traffic meter, over the wire (2026-08-20) — observability reaching the
+     * wire's clients. Reading it is deliberately not metered.
+     */
+    public synchronized SmokeSignalServer.WireStats stats() throws IOException {
+        out.writeByte(SmokeSignalServer.OP_STATS);
+        out.flush();
+        readReply();
+        return new SmokeSignalServer.WireStats(in.readLong(), in.readLong(), in.readLong(),
+                in.readLong(), in.readLong(), in.readLong(), in.readLong(), in.readLong());
+    }
+
+    /**
      * Stage a batch of puts and deletes to send as ONE wire request (2026-08-19). The server
      * reads the whole batch before touching its route, and hands it to the route whole — so
      * when the served store's owner routed batches to a real atomic batcher (Twine, in the

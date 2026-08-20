@@ -174,6 +174,39 @@ class SmokeSignalTest {
     }
 
     @Test
+    void rangeAndStatsTravelTheWire(@TempDir Path dir) throws IOException {
+        Random rnd = new Random(19);
+        TreeMap<Long, String> oracle = new TreeMap<>();
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts());
+             SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store,
+                     SpillSerializer.forLongs(), SpillSerializer.forStrings());
+             SmokeSignalClient<Long, String> wire = client(server.port())) {
+            for (int i = 0; i < 300; i++) {
+                long key = rnd.nextInt(150);
+                String v = "v" + key + ":" + i;
+                store.put(key, v);
+                oracle.put(key, v);
+            }
+
+            // OP_RANGE: the fetched records equal the oracle's submap, in key order.
+            var fetched = wire.rangeQuery(40L, 110L);
+            assertEquals(oracle.subMap(40L, true, 110L, true),
+                    new TreeMap<>(fetched), "the wire delivers the range exactly");
+            assertEquals(new java.util.ArrayList<>(oracle.subMap(40L, true, 110L, true).keySet()),
+                    new java.util.ArrayList<>(fetched.keySet()), "in key order");
+            assertTrue(wire.rangeQuery(9_000L, 9_999L).isEmpty(), "an empty range is empty");
+
+            // OP_STATS: the meter travels, and reading it is not itself metered.
+            SmokeSignalServer.WireStats remote = wire.stats();
+            assertEquals(server.stats(), remote, "the wire reports its own meter faithfully");
+            assertEquals(2, remote.rangeQueries(), "both range fetches counted");
+            SmokeSignalServer.WireStats again = wire.stats();
+            assertEquals(remote.requestsServed(), again.requestsServed(),
+                    "stats requests are observability, not traffic - unmetered");
+        }
+    }
+
+    @Test
     void aBatchCrossesTheWireWholeAndLandsThroughTheBatchRoute(@TempDir Path dir)
             throws IOException {
         // The route receives the COMPLETE batch in one call, in staged order — the atomicity

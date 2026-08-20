@@ -87,6 +87,8 @@ public final class SmokeSignalServer<K, V> implements Closeable {
     static final byte OP_SIZE = 4;
     static final byte OP_COUNT_RANGE = 5;
     static final byte OP_BATCH = 6;                            // 2026-08-19: batches over the wire
+    static final byte OP_RANGE = 7;                            // 2026-08-20: fetch a range's records
+    static final byte OP_STATS = 8;                            // 2026-08-20: the wire's own meter
     static final byte BATCH_OP_PUT = 1;
     static final byte BATCH_OP_DELETE = 2;
     static final byte REPLY_NULL = 0;
@@ -307,6 +309,40 @@ public final class SmokeSignalServer<K, V> implements Closeable {
                 K hi = keySerializer.read(in);
                 out.writeByte(REPLY_VALUE);
                 out.writeInt(store.countRange(lo, hi));
+            }
+            case OP_RANGE -> {
+                // Fetch [lo, hi]'s records, in key order (2026-08-20) — the read countRange
+                // could always count but never deliver. Materialized server-side before the
+                // reply (the store's range callback cannot straddle socket writes), so the
+                // memory bound is the range's size: ask for sane ranges, the same honesty
+                // countRange always demanded of its callers.
+                rangeQueries.incrementAndGet();
+                K lo = keySerializer.read(in);
+                K hi = keySerializer.read(in);
+                List<Object[]> records = new ArrayList<>();
+                store.range(lo, hi, (k, v) -> records.add(new Object[]{k, v}));
+                out.writeByte(REPLY_VALUE);
+                out.writeInt(records.size());
+                for (Object[] rec : records) {
+                    @SuppressWarnings("unchecked") K k = (K) rec[0];
+                    @SuppressWarnings("unchecked") V v = (V) rec[1];
+                    keySerializer.write(k, out);
+                    valueSerializer.write(v, out);
+                }
+            }
+            case OP_STATS -> {
+                // The wire's own meter, readable by its clients (2026-08-20). Deliberately
+                // NOT metered itself: a meter that counts being read muddies every reading.
+                WireStats s = stats();
+                out.writeByte(REPLY_VALUE);
+                out.writeLong(s.connectionsAccepted());
+                out.writeLong(s.gets());
+                out.writeLong(s.puts());
+                out.writeLong(s.deletes());
+                out.writeLong(s.sizeQueries());
+                out.writeLong(s.rangeQueries());
+                out.writeLong(s.batches());
+                out.writeLong(s.errors());
             }
             case OP_BATCH -> {
                 batchRequests.incrementAndGet();

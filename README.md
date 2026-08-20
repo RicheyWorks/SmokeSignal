@@ -39,6 +39,12 @@ op lands on the store's single writer lock). A dead wire never hurts the store.
   behavior: the route *is* the store. Same lesson Twine's sink seam taught, pointed at the
   wire; WholeHog's findings ledger carried it as "deliberately unsolved" until this consumer
   arrived.
+- **The range travels, and so does the meter (2026-08-20).** `OP_RANGE` delivers a key
+  range's records in key order — `countRange` could always count them; `rangeQuery(lo, hi)`
+  fetches them (materialized on both ends: ask for sane ranges, the honesty countRange
+  always demanded). `OP_STATS` sends the server's own `WireStats` to any client —
+  observability reaching the wire's far end — and reading the meter is deliberately not
+  metered.
 - **Batches cross whole (2026-08-19).** `OP_BATCH` carries a staged list of puts/deletes as
   one request; the server reads the entire batch off the socket before touching its
   `BatchRoute`, so the route decides atomicity and the wire never applies half a request.
