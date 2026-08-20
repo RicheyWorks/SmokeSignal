@@ -138,6 +138,41 @@ class SmokeSignalTest {
     }
 
     @Test
+    void writesFollowTheRouteReadsStayOnTheStore(@TempDir Path dir) throws IOException {
+        // The WriteRoute seam: every wire write must land through the route, never straight
+        // on the served store — the routing rule an IndexedStore owner needs. The route here
+        // tags values so a bypass would be visible in the bytes.
+        java.util.concurrent.atomic.AtomicInteger routedPuts =
+                new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger routedDeletes =
+                new java.util.concurrent.atomic.AtomicInteger();
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts())) {
+            SmokeSignalServer.WriteRoute<Long, String> route =
+                    new SmokeSignalServer.WriteRoute<>() {
+                        @Override public void put(Long key, String value) throws IOException {
+                            routedPuts.incrementAndGet();
+                            store.put(key, "routed:" + value);
+                        }
+                        @Override public boolean delete(Long key) throws IOException {
+                            routedDeletes.incrementAndGet();
+                            return store.delete(key);
+                        }
+                    };
+            try (SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store, route,
+                         SpillSerializer.forLongs(), SpillSerializer.forStrings());
+                 SmokeSignalClient<Long, String> wire = client(server.port())) {
+                wire.put(1L, "a");
+                assertEquals("routed:a", wire.get(1L), "the write went through the route");
+                assertEquals("routed:a", store.get(1L), "and landed in the store the route chose");
+                assertTrue(wire.delete(1L), "delete answers through the route");
+                assertFalse(wire.delete(1L), "delete-of-absent is a no-op false, per the contract");
+                assertEquals(1, routedPuts.get(), "exactly one routed put");
+                assertEquals(2, routedDeletes.get(), "both deletes routed");
+            }
+        }
+    }
+
+    @Test
     void anUnknownOpIsRefusedCountedAndHarmless(@TempDir Path dir) throws IOException {
         try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts());
              SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store,

@@ -29,8 +29,35 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>Concurrency is the store's own: every client op lands on the store's single writer lock,
  * so N clients interleave exactly like N threads calling the store directly.</p>
+ *
+ * <h2>The write route (2026-08-19)</h2>
+ *
+ * <p>Writes over the wire used to go straight to the served store — correct for a standalone
+ * SmokeHouse, wrong the moment the store sits behind an {@code IndexedStore}, whose secondary
+ * and interval indexes must see every mutation. That is the same lesson Twine's sink seam
+ * taught, pointed at the wire: WholeHog's findings ledger carried it as "deliberately unsolved
+ * until a consumer needs it", and the consumer arrived. {@link WriteRoute} is the seam:
+ * {@link #serve(SmokeHouse, SpillSerializer, SpillSerializer)} keeps the old behavior (the
+ * route IS the store), and {@link #serve(SmokeHouse, WriteRoute, SpillSerializer, SpillSerializer)}
+ * lets a composed caller route wire writes through its index fan-out while reads stay on the
+ * primary's read surface.</p>
  */
 public final class SmokeSignalServer<K, V> implements Closeable {
+
+    /**
+     * Where the wire's writes land. The contract is the ecosystem's write-seam contract:
+     * {@code put} is a last-writer-wins upsert, {@code delete} of an absent key is a no-op
+     * that answers {@code false}. Reads are NOT routed — they stay on the served store,
+     * because a route that answered reads differently from the store it fronts would make
+     * the wire lie.
+     */
+    public interface WriteRoute<K, V> {
+        /** Last-writer-wins upsert. */
+        void put(K key, V value) throws IOException;
+
+        /** Delete; answers whether the key existed (a no-op {@code false} when absent). */
+        boolean delete(K key) throws IOException;
+    }
 
     static final byte OP_GET = 1;
     static final byte OP_PUT = 2;
@@ -42,6 +69,7 @@ public final class SmokeSignalServer<K, V> implements Closeable {
     static final byte REPLY_ERROR = 2;
 
     private final SmokeHouse<K, V> store;
+    private final WriteRoute<K, V> writeRoute;
     private final SpillSerializer<K> keySerializer;
     private final SpillSerializer<V> valueSerializer;
     private final ServerSocket server;
@@ -82,9 +110,11 @@ public final class SmokeSignalServer<K, V> implements Closeable {
         }
     }
 
-    private SmokeSignalServer(SmokeHouse<K, V> store, SpillSerializer<K> keySerializer,
+    private SmokeSignalServer(SmokeHouse<K, V> store, WriteRoute<K, V> writeRoute,
+                              SpillSerializer<K> keySerializer,
                               SpillSerializer<V> valueSerializer, ServerSocket server) {
         this.store = store;
+        this.writeRoute = writeRoute;
         this.keySerializer = keySerializer;
         this.valueSerializer = valueSerializer;
         this.server = server;
@@ -92,14 +122,37 @@ public final class SmokeSignalServer<K, V> implements Closeable {
         this.acceptor.setDaemon(true);
     }
 
-    /** Put {@code store} on an ephemeral loopback port (see {@link #port()}). */
+    /**
+     * Put {@code store} on an ephemeral loopback port (see {@link #port()}). Writes over the
+     * wire land on the store itself — correct for a standalone SmokeHouse; a store behind an
+     * index fan-out should use the {@link WriteRoute} overload instead.
+     */
     public static <K, V> SmokeSignalServer<K, V> serve(SmokeHouse<K, V> store,
+                                                       SpillSerializer<K> keySerializer,
+                                                       SpillSerializer<V> valueSerializer)
+            throws IOException {
+        Objects.requireNonNull(store, "store");
+        return serve(store, new WriteRoute<K, V>() {
+            @Override public void put(K key, V value) throws IOException { store.put(key, value); }
+            @Override public boolean delete(K key) throws IOException { return store.delete(key); }
+        }, keySerializer, valueSerializer);
+    }
+
+    /**
+     * Put {@code store} on an ephemeral loopback port with an explicit write route: reads
+     * answer from {@code store}, writes land through {@code writeRoute}. This is how a
+     * composed caller (an {@code IndexedStore} owner) keeps the routing rule — writes go
+     * through the index fan-out, never the primary — while still speaking the wire.
+     */
+    public static <K, V> SmokeSignalServer<K, V> serve(SmokeHouse<K, V> store,
+                                                       WriteRoute<K, V> writeRoute,
                                                        SpillSerializer<K> keySerializer,
                                                        SpillSerializer<V> valueSerializer)
             throws IOException {
         Objects.requireNonNull(store, "store");
         ServerSocket server = new ServerSocket(0, 16, InetAddress.getLoopbackAddress());
         SmokeSignalServer<K, V> s = new SmokeSignalServer<>(store,
+                Objects.requireNonNull(writeRoute, "writeRoute"),
                 Objects.requireNonNull(keySerializer, "keySerializer"),
                 Objects.requireNonNull(valueSerializer, "valueSerializer"), server);
         s.acceptor.start();
@@ -177,12 +230,12 @@ public final class SmokeSignalServer<K, V> implements Closeable {
                 puts.incrementAndGet();
                 K key = keySerializer.read(in);
                 V value = valueSerializer.read(in);
-                store.put(key, value);
+                writeRoute.put(key, value);                    // writes go through the route
                 out.writeByte(REPLY_VALUE);
             }
             case OP_DELETE -> {
                 deletes.incrementAndGet();
-                boolean existed = store.delete(keySerializer.read(in));
+                boolean existed = writeRoute.delete(keySerializer.read(in));
                 out.writeByte(REPLY_VALUE);
                 out.writeBoolean(existed);
             }

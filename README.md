@@ -32,6 +32,13 @@ op lands on the store's single writer lock). A dead wire never hurts the store.
 - **All consistency is the store's.** Every op lands on the single writer lock, so N wires
   interleave exactly like N local threads; the server adds no caching, no queueing, no
   reordering. Bad requests get `REPLY_ERROR`; a dead wire ends its session and nothing else.
+- **Writes take the route (2026-08-19).** `serve(store, writeRoute, …)` sends every wire
+  PUT/DELETE through a caller-supplied `WriteRoute` while reads stay on the served store —
+  the seam a composed caller (an `IndexedStore` owner) needs so wire writes reach the index
+  fan-out instead of bypassing it. The plain `serve(store, …)` overload keeps the old
+  behavior: the route *is* the store. Same lesson Twine's sink seam taught, pointed at the
+  wire; WholeHog's findings ledger carried it as "deliberately unsolved" until this consumer
+  arrived.
 
 ## The ecosystem
 
