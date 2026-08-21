@@ -353,8 +353,9 @@ public final class SmokeSignalServer<K, V> implements Closeable {
             case OP_SIZE -> {
                 sizeQueries.incrementAndGet();
                 execute(out, () -> {
+                    int size = store.size();               // value BEFORE the reply byte (S1w discipline)
                     out.writeByte(REPLY_VALUE);
-                    out.writeInt(store.size());
+                    out.writeInt(size);
                 });
             }
             case OP_COUNT_RANGE -> {
@@ -362,8 +363,18 @@ public final class SmokeSignalServer<K, V> implements Closeable {
                 K hi = keySerializer.read(in);
                 rangeQueries.incrementAndGet();
                 execute(out, () -> {
+                    // Twelfth pass: compute the count BEFORE writing any reply byte, exactly as
+                    // OP_RANGE materializes before it writes. execute() turns a thrown
+                    // RuntimeException into a REPLY_ERROR, but it cannot un-write bytes already sent
+                    // — so a value-producing call that can throw (countRange runs the store's
+                    // comparator, which a caller may supply and which may reject incomparable keys)
+                    // must run before REPLY_VALUE, or the error reply lands AFTER it and desyncs the
+                    // session. (Reachable only with a throwing comparator today, but the S1w framing
+                    // ADR made "materialize before write" the rule; this was the one read op still
+                    // breaking it.)
+                    int count = store.countRange(lo, hi);
                     out.writeByte(REPLY_VALUE);
-                    out.writeInt(store.countRange(lo, hi));
+                    out.writeInt(count);
                 });
             }
             case OP_RANGE -> {

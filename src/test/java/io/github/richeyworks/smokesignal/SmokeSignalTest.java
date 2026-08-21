@@ -9,6 +9,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.Random;
 import java.util.TreeMap;
 
@@ -353,6 +354,44 @@ class SmokeSignalTest {
                 assertEquals(-1, in.read(), "and the session closes rather than parsing garbage");
             }
             assertEquals(0, store.size(), "no half-batch, no garbage — the store is untouched");
+        }
+    }
+
+    @Test
+    void aRefusedCountRangeKeepsTheSessionAligned(@TempDir Path dir) throws IOException {
+        // Twelfth pass: OP_COUNT_RANGE must compute the count BEFORE it writes REPLY_VALUE (the S1w
+        // "materialize before write" discipline OP_RANGE already keeps). execute() turns a thrown
+        // RuntimeException into a REPLY_ERROR but cannot un-write bytes already sent, so writing
+        // REPLY_VALUE first and then throwing lands the error AFTER it — desyncing every later
+        // request. A comparator that rejects a poison key makes countRange throw, exercising exactly
+        // that path.
+        Comparator<Long> poison = (a, b) -> {
+            if (a == -999L || b == -999L) {
+                throw new RuntimeException("incomparable poison key");
+            }
+            return Long.compare(a, b);
+        };
+        SmokeHouseOptions<Long, String> opts = SmokeHouseOptions.of(
+                        SpillSerializer.forLongs(), SpillSerializer.forStrings(), poison)
+                .indexTier(SmokeHouseOptions.IndexTier.STATIC);
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts);
+             SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store,
+                     SpillSerializer.forLongs(), SpillSerializer.forStrings());
+             SmokeSignalClient<Long, String> wire = client(server.port())) {
+            wire.put(1L, "one");
+            wire.put(2L, "two");
+            assertEquals(2, wire.size(), "the wire serves before the poison");
+
+            // The count runs the store's comparator against the poison key, which throws. It must
+            // come back as a clean wire error — not a REPLY_VALUE followed by an error that desyncs.
+            assertThrows(IOException.class, () -> wire.countRange(-999L, -999L),
+                    "a comparator that throws surfaces as a recoverable wire error");
+
+            // The session must still be aligned: every later request behaves normally.
+            assertEquals("one", wire.get(1L), "the session survived the refused count");
+            assertEquals(2, wire.size(), "and keeps serving reads");
+            wire.put(3L, "three");
+            assertEquals("three", wire.get(3L), "and writes");
         }
     }
 }
