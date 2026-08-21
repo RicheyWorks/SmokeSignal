@@ -267,13 +267,43 @@ class SmokeSignalTest {
     }
 
     @Test
-    void anUnknownOpIsRefusedCountedAndHarmless(@TempDir Path dir) throws IOException {
+    void aHugeRefusalMessageDoesNotKillTheSession(@TempDir Path dir) throws IOException {
+        // Tenth-pass S2w: a route throwing a >64KB message must not blow up writeUTF and drop
+        // the connection — the refusal must come back and the session keep serving.
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts())) {
+            String giant = "x".repeat(200_000);
+            SmokeSignalServer.WriteRoute<Long, String> route =
+                    new SmokeSignalServer.WriteRoute<>() {
+                        @Override public void put(Long k, String v) {
+                            throw new IllegalStateException(giant);   // an oversized message
+                        }
+                        @Override public boolean delete(Long k) throws IOException {
+                            return store.delete(k);
+                        }
+                    };
+            try (SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store, route,
+                         SpillSerializer.forLongs(), SpillSerializer.forStrings());
+                 SmokeSignalClient<Long, String> wire = client(server.port())) {
+                IOException refused = assertThrows(IOException.class, () -> wire.put(1L, "a"),
+                        "the oversized refusal comes back as an error, not a dropped connection");
+                assertTrue(refused.getMessage().contains("truncated"), "and it was truncated");
+                store.put(2L, "b");
+                assertEquals("b", wire.get(2L), "the session keeps serving after the refusal");
+            }
+        }
+    }
+
+    @Test
+    void anUnknownOpIsRefusedAndClosesTheSession(@TempDir Path dir) throws IOException {
+        // ADR wire-framing (2026-08-20): an unknown op is a FRAMING error — the server cannot
+        // know how many bytes the client intended to follow it, so it replies once and CLOSES
+        // the session rather than parsing garbage. The store is untouched, and a FRESH client
+        // still works (the server itself keeps accepting).
         try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts());
              SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store,
                      SpillSerializer.forLongs(), SpillSerializer.forStrings())) {
             store.put(5L, "five");
 
-            // Speak garbage at the protocol directly: an op byte the server never defined.
             try (java.net.Socket raw = new java.net.Socket(
                     java.net.InetAddress.getLoopbackAddress(), server.port())) {
                 java.io.DataOutputStream out = new java.io.DataOutputStream(raw.getOutputStream());
@@ -281,19 +311,48 @@ class SmokeSignalTest {
                 out.writeByte(99);                             // not an op
                 out.flush();
                 assertEquals(2 /* REPLY_ERROR */, in.readByte(),
-                        "an unknown op earns an error reply, not a dropped session");
-                assertTrue(in.readUTF().contains("unknown op"), "and says why");
+                        "an unknown op earns an error reply first");
+                assertTrue(in.readUTF().contains("framing"), "and names the framing error");
+                assertEquals(-1, in.read(), "then the session is closed (EOF), not left desynced");
             }
 
-            // The refusal was counted, and the store is untouched by a garbage wire.
             assertEquals(1, server.stats().errors(), "the refusal is on the meter");
             assertEquals(0, server.stats().requestsServed(), "a refused op is not a served request");
             assertEquals("five", store.get(5L), "the store never felt it");
 
-            // And the session that spoke garbage still works for a well-formed client after.
+            // The SERVER keeps accepting — only the offending session died.
             try (SmokeSignalClient<Long, String> fresh = client(server.port())) {
-                assertEquals("five", fresh.get(5L), "the wire keeps serving after a refusal");
+                assertEquals("five", fresh.get(5L), "the server keeps serving new clients");
             }
+        }
+    }
+
+    @Test
+    void anUnknownBatchOpTypeClosesInsteadOfCorruptingTheStore(@TempDir Path dir)
+            throws IOException {
+        // The desync bug S1w named: a bad op-type byte mid-batch used to be reinterpreted as
+        // fresh opcodes, writing garbage into the store. Now it's a framing error — the store
+        // is untouched and the session closes.
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts());
+             SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store,
+                     SpillSerializer.forLongs(), SpillSerializer.forStrings())) {
+            try (java.net.Socket raw = new java.net.Socket(
+                    java.net.InetAddress.getLoopbackAddress(), server.port())) {
+                java.io.DataOutputStream out = new java.io.DataOutputStream(raw.getOutputStream());
+                java.io.DataInputStream in = new java.io.DataInputStream(raw.getInputStream());
+                out.writeByte(6);                              // OP_BATCH
+                out.writeInt(2);                               // claims 2 ops
+                out.writeByte(1);                              // op 1: PUT
+                SpillSerializer.forLongs().write(1L, out);
+                SpillSerializer.forStrings().write("one", out);
+                out.writeByte(77);                             // op 2: a bogus op-type byte
+                SpillSerializer.forLongs().write(2L, out);
+                out.flush();
+                assertEquals(2 /* REPLY_ERROR */, in.readByte(), "the bad batch op is refused");
+                in.readUTF();
+                assertEquals(-1, in.read(), "and the session closes rather than parsing garbage");
+            }
+            assertEquals(0, store.size(), "no half-batch, no garbage — the store is untouched");
         }
     }
 }

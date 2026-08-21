@@ -261,10 +261,17 @@ public final class SmokeSignalServer<K, V> implements Closeable {
                 }
                 try {
                     handle(op, in, out);
-                } catch (RuntimeException e) {                 // bad request, store refusal…
+                } catch (RuntimeException framing) {
+                    // ADR wire-framing (2026-08-20): a RuntimeException out of handle() is a
+                    // READ-phase failure — an unknown op, an unknown batch-op byte, or a
+                    // serializer refusing a field. The stream position is now unknown, so the
+                    // session cannot safely continue. Reply once, then CLOSE. (Execution
+                    // failures never reach here — they are handled in-place as recoverable
+                    // REPLY_ERRORs by execute(...).)
                     errors.incrementAndGet();
-                    out.writeByte(REPLY_ERROR);
-                    out.writeUTF(String.valueOf(e.getMessage()));
+                    writeError(out, "unrecoverable request framing error; closing session", framing);
+                    out.flush();
+                    return;
                 }
                 out.flush();
             }
@@ -273,42 +280,91 @@ public final class SmokeSignalServer<K, V> implements Closeable {
         }
     }
 
+    /** A reply-writing / store-touching action whose {@link RuntimeException} is recoverable. */
+    @FunctionalInterface
+    private interface Execution {
+        void run() throws IOException;
+    }
+
+    /**
+     * The execute phase (ADR wire-framing 2026-08-20): the request has been fully read, so the
+     * stream is aligned and the reply slot is ours. A {@link RuntimeException} here (a store
+     * refusal, a route throwing) is a recoverable {@code REPLY_ERROR} — the session keeps
+     * serving. {@link IOException} (a broken store, a dead socket) propagates and ends the
+     * session, exactly as before.
+     */
+    private void execute(DataOutputStream out, Execution body) throws IOException {
+        try {
+            body.run();
+        } catch (RuntimeException recoverable) {
+            errors.incrementAndGet();
+            writeError(out, "request refused", recoverable);
+        }
+    }
+
+    /** Write a REPLY_ERROR with a truncated message (S2w: writeUTF caps at 64KB). */
+    private static void writeError(DataOutputStream out, String context, Throwable cause)
+            throws IOException {
+        out.writeByte(REPLY_ERROR);
+        String msg = context + ": " + cause.getMessage();
+        out.writeUTF(msg.length() > 40_000 ? msg.substring(0, 40_000) + "…(truncated)" : msg);
+    }
+
+    /**
+     * Handle one request. Each case READS all its fields first — a throw during the read phase
+     * (an unknown op, an unknown batch-op byte, a serializer refusing a field) propagates to the
+     * session loop, which closes the session because the stream position is now unknown. The
+     * store/route touch and the reply write happen inside {@link #execute}, where a
+     * {@code RuntimeException} is a recoverable {@code REPLY_ERROR}.
+     */
     private void handle(byte op, DataInputStream in, DataOutputStream out) throws IOException {
         switch (op) {
             case OP_GET -> {
+                K key = keySerializer.read(in);                // read phase
                 gets.incrementAndGet();
-                V value = store.get(keySerializer.read(in));
-                if (value == null) {
-                    out.writeByte(REPLY_NULL);
-                } else {
-                    out.writeByte(REPLY_VALUE);
-                    valueSerializer.write(value, out);
-                }
+                execute(out, () -> {                           // execute phase
+                    V value = store.get(key);
+                    if (value == null) {
+                        out.writeByte(REPLY_NULL);
+                    } else {
+                        out.writeByte(REPLY_VALUE);
+                        valueSerializer.write(value, out);
+                    }
+                });
             }
             case OP_PUT -> {
-                puts.incrementAndGet();
                 K key = keySerializer.read(in);
                 V value = valueSerializer.read(in);
-                writeRoute.put(key, value);                    // writes go through the route
-                out.writeByte(REPLY_VALUE);
+                puts.incrementAndGet();
+                execute(out, () -> {
+                    writeRoute.put(key, value);                // writes go through the route
+                    out.writeByte(REPLY_VALUE);
+                });
             }
             case OP_DELETE -> {
+                K key = keySerializer.read(in);
                 deletes.incrementAndGet();
-                boolean existed = writeRoute.delete(keySerializer.read(in));
-                out.writeByte(REPLY_VALUE);
-                out.writeBoolean(existed);
+                execute(out, () -> {
+                    boolean existed = writeRoute.delete(key);
+                    out.writeByte(REPLY_VALUE);
+                    out.writeBoolean(existed);
+                });
             }
             case OP_SIZE -> {
                 sizeQueries.incrementAndGet();
-                out.writeByte(REPLY_VALUE);
-                out.writeInt(store.size());
+                execute(out, () -> {
+                    out.writeByte(REPLY_VALUE);
+                    out.writeInt(store.size());
+                });
             }
             case OP_COUNT_RANGE -> {
-                rangeQueries.incrementAndGet();
                 K lo = keySerializer.read(in);
                 K hi = keySerializer.read(in);
-                out.writeByte(REPLY_VALUE);
-                out.writeInt(store.countRange(lo, hi));
+                rangeQueries.incrementAndGet();
+                execute(out, () -> {
+                    out.writeByte(REPLY_VALUE);
+                    out.writeInt(store.countRange(lo, hi));
+                });
             }
             case OP_RANGE -> {
                 // Fetch [lo, hi]'s records, in key order (2026-08-20) — the read countRange
@@ -316,43 +372,48 @@ public final class SmokeSignalServer<K, V> implements Closeable {
                 // reply (the store's range callback cannot straddle socket writes), so the
                 // memory bound is the range's size: ask for sane ranges, the same honesty
                 // countRange always demanded of its callers.
-                rangeQueries.incrementAndGet();
                 K lo = keySerializer.read(in);
                 K hi = keySerializer.read(in);
-                List<Object[]> records = new ArrayList<>();
-                store.range(lo, hi, (k, v) -> records.add(new Object[]{k, v}));
-                out.writeByte(REPLY_VALUE);
-                out.writeInt(records.size());
-                for (Object[] rec : records) {
-                    @SuppressWarnings("unchecked") K k = (K) rec[0];
-                    @SuppressWarnings("unchecked") V v = (V) rec[1];
-                    keySerializer.write(k, out);
-                    valueSerializer.write(v, out);
-                }
+                rangeQueries.incrementAndGet();
+                execute(out, () -> {
+                    List<Object[]> records = new ArrayList<>();
+                    store.range(lo, hi, (k, v) -> records.add(new Object[]{k, v}));
+                    out.writeByte(REPLY_VALUE);
+                    out.writeInt(records.size());
+                    for (Object[] rec : records) {
+                        @SuppressWarnings("unchecked") K k = (K) rec[0];
+                        @SuppressWarnings("unchecked") V v = (V) rec[1];
+                        keySerializer.write(k, out);
+                        valueSerializer.write(v, out);
+                    }
+                });
             }
             case OP_STATS -> {
                 // The wire's own meter, readable by its clients (2026-08-20). Deliberately
                 // NOT metered itself: a meter that counts being read muddies every reading.
-                WireStats s = stats();
-                out.writeByte(REPLY_VALUE);
-                out.writeLong(s.connectionsAccepted());
-                out.writeLong(s.gets());
-                out.writeLong(s.puts());
-                out.writeLong(s.deletes());
-                out.writeLong(s.sizeQueries());
-                out.writeLong(s.rangeQueries());
-                out.writeLong(s.batches());
-                out.writeLong(s.errors());
+                execute(out, () -> {
+                    WireStats s = stats();
+                    out.writeByte(REPLY_VALUE);
+                    out.writeLong(s.connectionsAccepted());
+                    out.writeLong(s.gets());
+                    out.writeLong(s.puts());
+                    out.writeLong(s.deletes());
+                    out.writeLong(s.sizeQueries());
+                    out.writeLong(s.rangeQueries());
+                    out.writeLong(s.batches());
+                    out.writeLong(s.errors());
+                });
             }
             case OP_BATCH -> {
-                batchRequests.incrementAndGet();
-                // Read the WHOLE batch off the socket before touching the route: the wire
-                // never applies half a request, whatever the route's atomicity.
+                // Read the WHOLE batch off the socket first: the wire never applies half a
+                // request, and a throw here (a bad op-type byte, a serializer refusal) is a
+                // framing error that closes the session — the stream position is unknown.
                 int count = in.readInt();
                 if (count < 0) {
                     throw new IllegalArgumentException("negative batch size " + count);
                 }
-                List<BatchOp<K, V>> ops = new ArrayList<>(count);
+                // S4w: never pre-size to an untrusted count — grow naturally; a real batch is small.
+                List<BatchOp<K, V>> ops = new ArrayList<>();
                 for (int i = 0; i < count; i++) {
                     byte type = in.readByte();
                     K key = keySerializer.read(in);
@@ -364,9 +425,12 @@ public final class SmokeSignalServer<K, V> implements Closeable {
                         throw new IllegalArgumentException("unknown batch op type " + type);
                     }
                 }
-                batchRoute.apply(ops);
-                out.writeByte(REPLY_VALUE);
-                out.writeInt(ops.size());
+                batchRequests.incrementAndGet();
+                execute(out, () -> {
+                    batchRoute.apply(ops);
+                    out.writeByte(REPLY_VALUE);
+                    out.writeInt(ops.size());
+                });
             }
             default -> throw new IllegalArgumentException("unknown op " + op);
         }

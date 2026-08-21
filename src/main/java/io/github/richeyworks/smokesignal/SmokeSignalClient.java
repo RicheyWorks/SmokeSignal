@@ -44,43 +44,67 @@ public final class SmokeSignalClient<K, V> implements Closeable {
         return c;
     }
 
+    /** Builds a request into a private buffer — its throw sends nothing (S3w). */
+    @FunctionalInterface
+    private interface FrameBuilder {
+        void build(DataOutputStream framed) throws IOException;
+    }
+
+    /**
+     * Serialize a whole request into memory, then write it to the socket in one shot (tenth-pass
+     * S3w). A serializer throwing mid-build sends NOTHING, so the client stays aligned and
+     * usable — the old code wrote fields straight to the socket and a mid-request throw left a
+     * partial frame buffered that the next call would flush, desyncing the server.
+     */
+    private void sendFrame(FrameBuilder builder) throws IOException {
+        java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+        DataOutputStream framed = new DataOutputStream(buf);
+        builder.build(framed);                             // may throw — nothing on the wire yet
+        framed.flush();
+        out.write(buf.toByteArray());
+        out.flush();
+    }
+
     /** The newest value for {@code key}, or {@code null} — a wire round-trip. */
     public synchronized V get(K key) throws IOException {
-        out.writeByte(SmokeSignalServer.OP_GET);
-        keySerializer.write(key, out);
-        out.flush();
+        sendFrame(f -> {
+            f.writeByte(SmokeSignalServer.OP_GET);
+            keySerializer.write(key, f);
+        });
         byte reply = readReply();
         return reply == SmokeSignalServer.REPLY_NULL ? null : valueSerializer.read(in);
     }
 
     public synchronized void put(K key, V value) throws IOException {
-        out.writeByte(SmokeSignalServer.OP_PUT);
-        keySerializer.write(key, out);
-        valueSerializer.write(value, out);
-        out.flush();
+        sendFrame(f -> {
+            f.writeByte(SmokeSignalServer.OP_PUT);
+            keySerializer.write(key, f);
+            valueSerializer.write(value, f);
+        });
         readReply();
     }
 
     public synchronized boolean delete(K key) throws IOException {
-        out.writeByte(SmokeSignalServer.OP_DELETE);
-        keySerializer.write(key, out);
-        out.flush();
+        sendFrame(f -> {
+            f.writeByte(SmokeSignalServer.OP_DELETE);
+            keySerializer.write(key, f);
+        });
         readReply();
         return in.readBoolean();
     }
 
     public synchronized int size() throws IOException {
-        out.writeByte(SmokeSignalServer.OP_SIZE);
-        out.flush();
+        sendFrame(f -> f.writeByte(SmokeSignalServer.OP_SIZE));
         readReply();
         return in.readInt();
     }
 
     public synchronized int countRange(K lo, K hi) throws IOException {
-        out.writeByte(SmokeSignalServer.OP_COUNT_RANGE);
-        keySerializer.write(lo, out);
-        keySerializer.write(hi, out);
-        out.flush();
+        sendFrame(f -> {
+            f.writeByte(SmokeSignalServer.OP_COUNT_RANGE);
+            keySerializer.write(lo, f);
+            keySerializer.write(hi, f);
+        });
         readReply();
         return in.readInt();
     }
@@ -92,10 +116,11 @@ public final class SmokeSignalClient<K, V> implements Closeable {
      * ask for sane ranges, the same honesty countRange always demanded.
      */
     public synchronized java.util.LinkedHashMap<K, V> rangeQuery(K lo, K hi) throws IOException {
-        out.writeByte(SmokeSignalServer.OP_RANGE);
-        keySerializer.write(lo, out);
-        keySerializer.write(hi, out);
-        out.flush();
+        sendFrame(f -> {
+            f.writeByte(SmokeSignalServer.OP_RANGE);
+            keySerializer.write(lo, f);
+            keySerializer.write(hi, f);
+        });
         readReply();
         int count = in.readInt();
         java.util.LinkedHashMap<K, V> records = new java.util.LinkedHashMap<>();
@@ -110,8 +135,7 @@ public final class SmokeSignalClient<K, V> implements Closeable {
      * wire's clients. Reading it is deliberately not metered.
      */
     public synchronized SmokeSignalServer.WireStats stats() throws IOException {
-        out.writeByte(SmokeSignalServer.OP_STATS);
-        out.flush();
+        sendFrame(f -> f.writeByte(SmokeSignalServer.OP_STATS));
         readReply();
         return new SmokeSignalServer.WireStats(in.readLong(), in.readLong(), in.readLong(),
                 in.readLong(), in.readLong(), in.readLong(), in.readLong(), in.readLong());
@@ -152,21 +176,22 @@ public final class SmokeSignalClient<K, V> implements Closeable {
         /** Send the batch as one request; answers how many ops the server applied. */
         public int commit() throws IOException {
             requireStaging();
-            committed = true;
             synchronized (SmokeSignalClient.this) {
-                out.writeByte(SmokeSignalServer.OP_BATCH);
-                out.writeInt(ops.size());
-                for (java.util.Map.Entry<K, V> op : ops) {
-                    if (op.getValue() != null) {
-                        out.writeByte(SmokeSignalServer.BATCH_OP_PUT);
-                        keySerializer.write(op.getKey(), out);
-                        valueSerializer.write(op.getValue(), out);
-                    } else {
-                        out.writeByte(SmokeSignalServer.BATCH_OP_DELETE);
-                        keySerializer.write(op.getKey(), out);
+                sendFrame(f -> {                           // S3w: built in memory, sent whole
+                    f.writeByte(SmokeSignalServer.OP_BATCH);
+                    f.writeInt(ops.size());
+                    for (java.util.Map.Entry<K, V> op : ops) {
+                        if (op.getValue() != null) {
+                            f.writeByte(SmokeSignalServer.BATCH_OP_PUT);
+                            keySerializer.write(op.getKey(), f);
+                            valueSerializer.write(op.getValue(), f);
+                        } else {
+                            f.writeByte(SmokeSignalServer.BATCH_OP_DELETE);
+                            keySerializer.write(op.getKey(), f);
+                        }
                     }
-                }
-                out.flush();
+                });
+                committed = true;                          // only after the whole frame is on the wire
                 readReply();
                 return in.readInt();
             }
