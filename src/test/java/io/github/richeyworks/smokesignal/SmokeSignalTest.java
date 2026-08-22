@@ -398,6 +398,36 @@ class SmokeSignalTest {
     }
 
     @Test
+    void firstLastAndPercentileOverTheWireMatchTheStore(@TempDir Path dir) throws IOException {
+        // Additive slice (2026-08-21), completing the wire's order-statistics surface: first, last,
+        // and percentile keys. All three answer null on an empty store; percentile clamps its pct to
+        // [1,100] rather than throwing, so every int answers a key on a non-empty store.
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts());
+             SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store,
+                     SpillSerializer.forLongs(), SpillSerializer.forStrings());
+             SmokeSignalClient<Long, String> wire = client(server.port())) {
+
+            assertNull(wire.firstKey(), "first of an empty store is null");
+            assertNull(wire.lastKey(), "last of an empty store is null");
+            assertNull(wire.percentileKey(50), "percentile of an empty store is null");
+
+            for (long k = 1; k <= 100; k++) {
+                wire.put(k, "v" + k);
+            }
+            assertEquals(store.firstKey(), wire.firstKey(), "firstKey over the wire matches the store");
+            assertEquals(store.lastKey(), wire.lastKey(), "lastKey matches");
+            for (int p : new int[]{1, 25, 50, 75, 100}) {
+                assertEquals(store.percentileKey(p), wire.percentileKey(p), "percentile " + p);
+            }
+            // Out-of-range percentiles clamp (they answer a key, not an error) — exactly as the store.
+            assertEquals(store.percentileKey(0), wire.percentileKey(0), "pct 0 clamps to the minimum");
+            assertEquals(store.percentileKey(101), wire.percentileKey(101), "pct 101 clamps to the maximum");
+
+            assertEquals("v50", wire.get(50L), "the session stays aligned");
+        }
+    }
+
+    @Test
     void aRefusedCountRangeKeepsTheSessionAligned(@TempDir Path dir) throws IOException {
         // Twelfth pass: OP_COUNT_RANGE must compute the count BEFORE it writes REPLY_VALUE (the S1w
         // "materialize before write" discipline OP_RANGE already keeps). execute() turns a thrown

@@ -92,6 +92,9 @@ public final class SmokeSignalServer<K, V> implements Closeable {
     static final byte OP_RANK = 9;                             // 2026-08-21: order statistics over the wire
     static final byte OP_NTH = 10;                             // 2026-08-21: the rank-th key (1-indexed)
     static final byte OP_MEDIAN = 11;                          // 2026-08-21: the lower-median key
+    static final byte OP_FIRST = 12;                           // 2026-08-21: the minimum key
+    static final byte OP_LAST = 13;                            // 2026-08-21: the maximum key
+    static final byte OP_PERCENTILE = 14;                      // 2026-08-21: the key at a percentile (1-100, clamped)
     static final byte BATCH_OP_PUT = 1;
     static final byte BATCH_OP_DELETE = 2;
     static final byte REPLY_NULL = 0;
@@ -313,6 +316,16 @@ public final class SmokeSignalServer<K, V> implements Closeable {
         out.writeUTF(msg.length() > 40_000 ? msg.substring(0, 40_000) + "…(truncated)" : msg);
     }
 
+    /** REPLY_NULL for a null key, else REPLY_VALUE + the serialized key — an order-statistics reply. */
+    private void writeKeyOrNull(DataOutputStream out, K key) throws IOException {
+        if (key == null) {
+            out.writeByte(REPLY_NULL);
+        } else {
+            out.writeByte(REPLY_VALUE);
+            keySerializer.write(key, out);
+        }
+    }
+
     /**
      * Handle one request. Each case READS all its fields first — a throw during the read phase
      * (an unknown op, an unknown batch-op byte, a serializer refusing a field) propagates to the
@@ -460,6 +473,22 @@ public final class SmokeSignalServer<K, V> implements Closeable {
                         keySerializer.write(k, out);
                     }
                 });
+            }
+            case OP_FIRST -> {
+                // The minimum live key; REPLY_NULL when the store is empty.
+                rangeQueries.incrementAndGet();
+                execute(out, () -> writeKeyOrNull(out, store.firstKey()));   // value BEFORE the byte
+            }
+            case OP_LAST -> {
+                // The maximum live key; REPLY_NULL when the store is empty.
+                rangeQueries.incrementAndGet();
+                execute(out, () -> writeKeyOrNull(out, store.lastKey()));
+            }
+            case OP_PERCENTILE -> {
+                // The key at percentile `pct` (1-100, clamped by the store); REPLY_NULL when empty.
+                int pct = in.readInt();
+                rangeQueries.incrementAndGet();
+                execute(out, () -> writeKeyOrNull(out, store.percentileKey(pct)));
             }
             case OP_BATCH -> {
                 // Read the WHOLE batch off the socket first: the wire never applies half a

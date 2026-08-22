@@ -144,6 +144,34 @@ public final class SmokeSignalClient<K, V> implements Closeable {
         return reply == SmokeSignalServer.REPLY_NULL ? null : keySerializer.read(in);
     }
 
+    /** The smallest live key, or {@code null} if the store is empty. */
+    public synchronized K firstKey() throws IOException {
+        sendFrame(f -> f.writeByte(SmokeSignalServer.OP_FIRST));
+        byte reply = readReply();
+        return reply == SmokeSignalServer.REPLY_NULL ? null : keySerializer.read(in);
+    }
+
+    /** The largest live key, or {@code null} if the store is empty. */
+    public synchronized K lastKey() throws IOException {
+        sendFrame(f -> f.writeByte(SmokeSignalServer.OP_LAST));
+        byte reply = readReply();
+        return reply == SmokeSignalServer.REPLY_NULL ? null : keySerializer.read(in);
+    }
+
+    /**
+     * The key at percentile {@code pct} of the live keys (1 = minimum, 100 = maximum); {@code pct}
+     * is clamped to {@code [1, 100]} by the store, so any int answers a key, or {@code null} when
+     * the store is empty.
+     */
+    public synchronized K percentileKey(int pct) throws IOException {
+        sendFrame(f -> {
+            f.writeByte(SmokeSignalServer.OP_PERCENTILE);
+            f.writeInt(pct);
+        });
+        byte reply = readReply();
+        return reply == SmokeSignalServer.REPLY_NULL ? null : keySerializer.read(in);
+    }
+
     /**
      * Fetch every record in {@code [lo, hi]} (both inclusive, by the store's comparator), in
      * key order (2026-08-20) — {@link #countRange} could always count them; this delivers
