@@ -358,6 +358,46 @@ class SmokeSignalTest {
     }
 
     @Test
+    void orderStatisticsOverTheWireMatchTheStore(@TempDir Path dir) throws IOException {
+        // Additive slice (2026-08-21): the store's order-statistics surface — rank, nth, median —
+        // reachable over the wire. The wire's contract is unchanged: every op behaves exactly like
+        // calling the store directly, checked here against the store as its own oracle.
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts());
+             SmokeSignalServer<Long, String> server = SmokeSignalServer.serve(store,
+                     SpillSerializer.forLongs(), SpillSerializer.forStrings());
+             SmokeSignalClient<Long, String> wire = client(server.port())) {
+
+            // Empty store: median is null, any rank is out of range (a clean error), absent key ranks 0.
+            assertNull(wire.medianKey(), "median of an empty store is null, over the wire");
+            assertThrows(IOException.class, () -> wire.nthKey(1), "nth of an empty store is out of range");
+            assertEquals(0, wire.rankOf(5L), "rank of an absent key is 0");
+
+            // Odd keys 1,3,...,199 — 100 keys, so ranks are well spread and boundaries are exact.
+            for (long k = 1; k < 200; k += 2) {
+                wire.put(k, "v" + k);
+            }
+            int n = store.size();
+            assertEquals(100, n);
+
+            // rankOf: present and absent keys alike agree with the store.
+            for (long k = 0; k <= 200; k++) {
+                assertEquals(store.rankOf(k), wire.rankOf(k), "rankOf " + k);
+            }
+            // nthKey: every in-range rank agrees; the two out-of-range ends are a clean wire error.
+            for (int r = 1; r <= n; r++) {
+                assertEquals(store.nthKey(r), wire.nthKey(r), "nthKey " + r);
+            }
+            assertThrows(IOException.class, () -> wire.nthKey(0), "rank 0 is out of range");
+            assertThrows(IOException.class, () -> wire.nthKey(n + 1), "rank size+1 is out of range");
+            assertEquals(store.medianKey(), wire.medianKey(), "median over the wire matches the store");
+
+            // The session survives the out-of-range errors: ordinary ops still work (WP-1 alignment).
+            assertEquals("v99", wire.get(99L), "the session stays aligned after order-stat errors");
+            assertEquals(100, wire.size());
+        }
+    }
+
+    @Test
     void aRefusedCountRangeKeepsTheSessionAligned(@TempDir Path dir) throws IOException {
         // Twelfth pass: OP_COUNT_RANGE must compute the count BEFORE it writes REPLY_VALUE (the S1w
         // "materialize before write" discipline OP_RANGE already keeps). execute() turns a thrown

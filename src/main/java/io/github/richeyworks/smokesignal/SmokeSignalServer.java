@@ -89,6 +89,9 @@ public final class SmokeSignalServer<K, V> implements Closeable {
     static final byte OP_BATCH = 6;                            // 2026-08-19: batches over the wire
     static final byte OP_RANGE = 7;                            // 2026-08-20: fetch a range's records
     static final byte OP_STATS = 8;                            // 2026-08-20: the wire's own meter
+    static final byte OP_RANK = 9;                             // 2026-08-21: order statistics over the wire
+    static final byte OP_NTH = 10;                             // 2026-08-21: the rank-th key (1-indexed)
+    static final byte OP_MEDIAN = 11;                          // 2026-08-21: the lower-median key
     static final byte BATCH_OP_PUT = 1;
     static final byte BATCH_OP_DELETE = 2;
     static final byte REPLY_NULL = 0;
@@ -413,6 +416,49 @@ public final class SmokeSignalServer<K, V> implements Closeable {
                     out.writeLong(s.rangeQueries());
                     out.writeLong(s.batches());
                     out.writeLong(s.errors());
+                });
+            }
+            case OP_RANK -> {
+                // Order statistics over the wire (2026-08-21): the ranked surface the store keeps
+                // for free, now reachable by a client. rankOf is 1-indexed, 0 for an absent key.
+                // Metered as a range/order-statistics read, like OP_COUNT_RANGE.
+                K key = keySerializer.read(in);
+                rangeQueries.incrementAndGet();
+                execute(out, () -> {
+                    int rank = store.rankOf(key);              // value BEFORE the reply byte (S1w/WP-1)
+                    out.writeByte(REPLY_VALUE);
+                    out.writeInt(rank);
+                });
+            }
+            case OP_NTH -> {
+                // The rank-th smallest key, 1-indexed. store.nthKey throws
+                // IndexOutOfBoundsException for a rank outside [1, size] (including any rank on an
+                // empty store); that RuntimeException becomes a recoverable REPLY_ERROR here, so an
+                // out-of-range ask is a clean wire error, not a desync (WP-1). The REPLY_NULL branch
+                // stays as defense in case nthKey ever answers null instead of throwing.
+                int rank = in.readInt();
+                rangeQueries.incrementAndGet();
+                execute(out, () -> {
+                    K k = store.nthKey(rank);                  // value BEFORE the reply byte
+                    if (k == null) {
+                        out.writeByte(REPLY_NULL);
+                    } else {
+                        out.writeByte(REPLY_VALUE);
+                        keySerializer.write(k, out);
+                    }
+                });
+            }
+            case OP_MEDIAN -> {
+                // The lower-median key; REPLY_NULL when the store is empty.
+                rangeQueries.incrementAndGet();
+                execute(out, () -> {
+                    K k = store.medianKey();                   // value BEFORE the reply byte
+                    if (k == null) {
+                        out.writeByte(REPLY_NULL);
+                    } else {
+                        out.writeByte(REPLY_VALUE);
+                        keySerializer.write(k, out);
+                    }
                 });
             }
             case OP_BATCH -> {

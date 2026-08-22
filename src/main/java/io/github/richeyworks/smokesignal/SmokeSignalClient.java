@@ -110,6 +110,41 @@ public final class SmokeSignalClient<K, V> implements Closeable {
     }
 
     /**
+     * The 1-indexed rank of {@code key} among the live keys, or {@code 0} if absent — the store's
+     * order-statistics surface over the wire (2026-08-21). O(log n) on the server, no scan.
+     */
+    public synchronized int rankOf(K key) throws IOException {
+        sendFrame(f -> {
+            f.writeByte(SmokeSignalServer.OP_RANK);
+            keySerializer.write(key, f);
+        });
+        readReply();
+        return in.readInt();
+    }
+
+    /**
+     * The {@code rank}-th smallest live key, 1-indexed (1 = minimum, {@code size()} = maximum). A
+     * rank outside {@code [1, size]} — including any rank on an empty store — surfaces the store's
+     * refusal as an {@link IOException} (the wire's form of {@code store.nthKey}'s
+     * {@code IndexOutOfBoundsException}); the session stays aligned and usable.
+     */
+    public synchronized K nthKey(int rank) throws IOException {
+        sendFrame(f -> {
+            f.writeByte(SmokeSignalServer.OP_NTH);
+            f.writeInt(rank);
+        });
+        byte reply = readReply();
+        return reply == SmokeSignalServer.REPLY_NULL ? null : keySerializer.read(in);
+    }
+
+    /** The lower-median live key, or {@code null} if the store is empty. */
+    public synchronized K medianKey() throws IOException {
+        sendFrame(f -> f.writeByte(SmokeSignalServer.OP_MEDIAN));
+        byte reply = readReply();
+        return reply == SmokeSignalServer.REPLY_NULL ? null : keySerializer.read(in);
+    }
+
+    /**
      * Fetch every record in {@code [lo, hi]} (both inclusive, by the store's comparator), in
      * key order (2026-08-20) — {@link #countRange} could always count them; this delivers
      * them. The reply is materialized, so the memory bound on both ends is the range's size:
